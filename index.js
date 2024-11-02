@@ -29,8 +29,8 @@
 			url: '/',
 			previewsContainer: document.createElement( 'div' ), // >> /dev/null
 			clickable: false,
-			accept: function ( file, done ) {
-				stageTwo( file );
+			accept: async function ( file, done ) {
+				await stageTwo( file );
 				dropzone.disable(); // Your job is done, buddy
 			}
 		} );
@@ -42,7 +42,9 @@
 		} );
 	}
 
-	function stageTwo ( file ) {
+	var latlngs = [];
+
+	async function stageTwo ( file ) {
 		heat = L.heatLayer( [], heatOptions ).addTo( map );
 
 		var type;
@@ -64,19 +66,31 @@
 		$( '#working' ).removeClass( 'hidden' );
 
 		var SCALAR_E7 = 0.0000001; // Since Google Takeout stores latlngs as integers
-		var latlngs = [];
 
 		var os = new oboe();
 
-		os.node( 'locations.*', function ( location ) {
-			var latitude = location.latitudeE7 * SCALAR_E7,
-				longitude = location.longitudeE7 * SCALAR_E7;
+		os.node( '{point time}', function ( location ) {
+			const regex = /(-?\d+\.\d+)\u00B0,\s*(-?\d+\.\d+)\u00B0/;
+			const match = location["point"].match(regex);
+			if (!match) {
+				console.log("no match", regex, location["point"]);
+				return;
+				return oboe.drop;
+			}
+			const latitude = parseFloat(match[1]);
+			const longitude = parseFloat(match[2]);
 
 			// Handle negative latlngs due to google unsigned/signed integer bug.
-			if ( latitude > 180 ) latitude = latitude - (2 ** 32) * SCALAR_E7;
-			if ( longitude > 180 ) longitude = longitude - (2 ** 32) * SCALAR_E7;
+			// if ( latitude > 180 ) latitude = latitude - (2 ** 32) * SCALAR_E7;
+			// if ( longitude > 180 ) longitude = longitude - (2 ** 32) * SCALAR_E7;
 
-			if ( type === 'json' && !isNaN(latitude) && !isNaN(longitude) ) latlngs.push( [ latitude, longitude ] );
+			if ( type === 'json' && !isNaN(latitude) && !isNaN(longitude) ) {
+				// console.log("adding point", latitude, longitude)
+				latlngs.push( [ latitude, longitude ] );
+			} else {
+				console.log("something wrong", latitude, longitude)
+			}
+			return;
 			return oboe.drop;
 		} ).done( function () {
 			status( 'Generating map...' );
@@ -92,7 +106,7 @@
 		status( 'Preparing to import file ( ' + fileSize + ' )...' );
 
 		// Now start working!
-		if ( type === 'json' ) parseJSONFile( file, os );
+		if ( type === 'json' ) await parseJSONFile( file, os );
 		if ( type === 'kml' ) parseKMLFile( file );
 	}
 
@@ -161,43 +175,96 @@
 	Break file into chunks and emit 'data' to oboe instance
 	*/
 
-	function parseJSONFile( file, oboeInstance ) {
-		var fileSize = file.size;
-		var prettyFileSize = prettySize(fileSize);
-		var chunkSize = 512 * 1024; // bytes
-		var offset = 0;
-		var self = this; // we need a reference to the current object
-		var chunkReaderBlock = null;
-		var startTime = Date.now();
-		var endTime = Date.now();
-		var readEventHandler = function ( evt ) {
-			if ( evt.target.error == null ) {
-				offset += evt.target.result.length;
-				var chunk = evt.target.result;
-				var percentLoaded = ( 100 * offset / fileSize ).toFixed( 0 );
-				status( percentLoaded + '% of ' + prettyFileSize + ' loaded...' );
-				oboeInstance.emit( 'data', chunk ); // callback for handling read chunk
-			} else {
-				return;
+	async function parseJSONFile( file, oboeInstance ) {
+		// Read the file and parse it as JSON
+		const fileContent = await file.text();
+		const jsonData = JSON.parse(fileContent);
+	
+		// Recursive function to traverse JSON and process matching objects
+		function traverse(obj) {
+			if (obj && typeof obj === 'object') {
+				// Check if the object has "point" and "location" properties
+				if (obj.hasOwnProperty('point') && obj.hasOwnProperty('time')) {
+					const regex = /(-?\d+\.\d+)\u00B0,\s*(-?\d+\.\d+)\u00B0/;
+					const match = obj["point"].match(regex);
+					if (!match) {
+						console.log("no match", regex, obj["point"]);
+						return;
+					}
+					const latitude = parseFloat(match[1]);
+					const longitude = parseFloat(match[2]);
+
+					// Handle negative latlngs due to google unsigned/signed integer bug.
+					// if ( latitude > 180 ) latitude = latitude - (2 ** 32) * SCALAR_E7;
+					// if ( longitude > 180 ) longitude = longitude - (2 ** 32) * SCALAR_E7;
+
+					if ( !isNaN(latitude) && !isNaN(longitude) ) {
+						// console.log("adding point", latitude, longitude)
+						latlngs.push( [ latitude, longitude ] );
+					} else {
+						console.log("something wrong", latitude, longitude)
+					}
+				}
+				// Recursively check all nested objects
+				for (const key in obj) {
+					if (obj.hasOwnProperty(key) && typeof obj[key] === 'object') {
+						traverse(obj[key]);
+					}
+				}
 			}
-			if ( offset >= fileSize ) {
-				oboeInstance.emit( 'done' );
-				return;
+		}
+
+		// Start the traversal
+		traverse(jsonData);
+
+		status( 'Generating map...' );
+		heat._latlngs = latlngs;
+
+		heat.redraw();
+		console.log("# of points", latlngs.length);
+		stageThree(  /* numberProcessed */ latlngs.length );
+
+		if (0) {
+			var fileSize = file.size;
+			var prettyFileSize = prettySize(fileSize);
+			var chunkSize = 512 * 1024; // bytes
+			var offset = 0;
+			var chunkReaderBlock = null;
+			var readEventHandler = function ( evt ) {
+				if ( evt.target.error == null ) {
+					offset += evt.target.result.length;
+					var chunk = evt.target.result;
+					var percentLoaded = ( 100 * offset / fileSize ).toFixed( 0 );
+					status( percentLoaded + '% of ' + prettyFileSize + ' loaded...' );
+					oboeInstance.emit( 'data', chunk ); // callback for handling read chunk
+				} else {
+					return;
+				}
+				if ( offset >= fileSize ) {
+					//oboeInstance.emit( 'done' );
+					status( 'Generating map...' );
+					heat._latlngs = latlngs;
+
+					heat.redraw();
+					console.log("# of points", latlngs.length);
+					stageThree(  /* numberProcessed */ latlngs.length );
+					return;
+				}
+
+				// of to the next chunk
+				chunkReaderBlock( offset, chunkSize, file );
 			}
 
-			// of to the next chunk
+			chunkReaderBlock = function ( _offset, length, _file ) {
+				var r = new FileReader();
+				var blob = _file.slice( _offset, length + _offset );
+				r.onload = readEventHandler;
+				r.readAsText( blob );
+			}
+
+			// now let's start the read with the first block
 			chunkReaderBlock( offset, chunkSize, file );
 		}
-
-		chunkReaderBlock = function ( _offset, length, _file ) {
-			var r = new FileReader();
-			var blob = _file.slice( _offset, length + _offset );
-			r.onload = readEventHandler;
-			r.readAsText( blob );
-		}
-
-		// now let's start the read with the first block
-		chunkReaderBlock( offset, chunkSize, file );
 	}
 
 	/*
